@@ -1,0 +1,940 @@
+###R codes for example illustration
+###Journal of Epidemiology, 2024. XX; XX-XX
+###Originally created by Sho Komukai
+###Last update 2024/2/24 (Kosuke Inoue)
+
+#Data (NHEFS) is publicly available at the following page
+https://wwwn.cdc.gov/nchs/nhanes/nhefs/
+https://www.hsph.harvard.edu/miguel-hernan/causal-inference-book/
+
+rm( list =ls() )
+setwd("C:/Users/XX/" )
+getwd()
+
+#--- install packages ---#
+if(0){
+	install.packages( c( "tableone", "stdReg", "sandwich" ) )
+}
+
+set.seed( 12345 )
+
+#-----------------#
+#--- read data ---#
+#-----------------#
+
+dt0                  <- read.csv( "data.csv" )
+head( dt0 )
+dim( dt0 )
+
+#---------------------#
+#--- analysis data ---#
+#---------------------#
+
+dt1                  <- dt0[ complete.cases( dt0 ), ]
+head( dt1 )
+dim( dt1 )
+
+
+#---------------#
+#--- income2 ---#
+#---------------#
+
+dt1$low_income       <- ifelse( dt1$income < median( dt1$income ), 1, 0 )
+dt1$low_income.f     <- ifelse( dt1$income < median( dt1$income ), "c1_income<19", "c0_income>=19" )
+
+
+#-----------------------#
+#--- summary of data ---#
+#-----------------------#
+
+library( tableone )
+
+Table1               <- print( 
+				 CreateTableOne( 
+				  vars       = c( "age", "sex", "race", "education", "active", 
+							"smokeyrs", "smokeintensity", 
+							"cholesterol", "hbp", "wt82", "death" ), 
+				  strata     = "low_income.f", 
+				  data       = dt1, 
+				  factorVars = c( "hbp", "sex", "race", "education", "qsmk", 
+							"exercise", "active", "death" ), 
+				  test       = TRUE
+				 ), 
+				 quote         = T, 
+				 nonnormal     = c( "cholesterol", "income", "age", "smokeintensity", 
+							"smokeyrs", "wt82" ), 
+				 showAllLevels = TRUE
+				)
+
+write.csv( Table1, "Table1.csv" )
+
+
+#------------------#
+#--- analysis 1 ---#
+#------------------#
+
+library( stdReg )
+library( sandwich )
+
+f.diff               <- function( est ){ est[ 2 ] - est[ 1 ] }
+f.rr                 <- function( est ){ log( est[ 2 ] ) - log( est[ 1 ] ) }
+f.or                 <- function( est ){ log( est[ 2 ] / ( 1 - est[ 2 ] ) ) - log( est[ 1 ] / ( 1 - est[ 1 ] ) ) }
+
+#--- backdoor criterion ---#
+
+#-----------------------
+# outcome regression
+reg.formula          <- formula( 
+				 death ~ low_income + age + factor( sex ) + factor( race ) + factor( education ) + 
+				 factor( active )
+				)
+reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt1 )
+stdreg               <- stdGlm( reg, data = dt1, X = "low_income", x = c( 0, 1 ) )
+
+diff                 <-      f.diff( stdreg$est )
+rr                   <- exp( f.rr(   stdreg$est ) )
+or                   <- exp( f.or(   stdreg$est ) )
+
+ci.diff              <- confint( stdreg, fun = f.diff )
+ci.rr                <- exp( confint( stdreg, fun = f.rr ) )
+ci.or                <- exp( confint( stdreg, fun = f.or ) )
+
+reg.boot.f           <- function( dt2 ){
+	reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt2 )
+	stdreg               <- stdGlm( reg, data = dt2, X = "low_income", x = c( 0, 1 ) )
+
+	diff                 <-      f.diff( stdreg$est )
+	rr                   <- exp( f.rr(   stdreg$est ) )
+	or                   <- exp( f.or(   stdreg$est ) )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+reg.boot             <- sapply( 1:1000, function( xxx )reg.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( reg.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( reg.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( reg.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res0.1               <- data.frame(
+				 valiable.selection = "backdoor", 
+				 Method             = "Outcome regression", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 rbind( ci.diff, ci.rr, ci.or ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+# propensity score
+ps.formula           <- formula( 
+				 low_income ~ age + factor( sex ) + factor( race ) + factor( education ) + 
+				 factor( active )
+				)
+ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt1 )
+dt1$weight           <- with( dt1, 
+				 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+				)
+diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt1 )
+rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt1 )
+or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt1 )
+
+diff                 <-      diff.res$coefficients[ 2 ]
+rr                   <- exp(   rr.res$coefficients[ 2 ] )
+or                   <- exp(   or.res$coefficients[ 2 ] )
+
+diff.se              <- sqrt( diag( vcovHC( diff.res, type = "HC0" ) ) )[ 2 ]
+rr.se                <- sqrt( diag( vcovHC(   rr.res, type = "HC0" ) ) )[ 2 ]
+or.se                <- sqrt( diag( vcovHC(   or.res, type = "HC0" ) ) )[ 2 ]
+
+diff.lower           <-           diff   + qnorm(0.025) * diff.se
+rr.lower             <- exp( log(   rr ) + qnorm(0.025) *   rr.se )
+or.lower             <- exp( log(   or ) + qnorm(0.025) *   or.se )
+
+diff.upper           <-          diff + qnorm(0.975) * diff.se
+rr.upper             <- exp( log(  rr ) + qnorm(0.975) *   rr.se )
+or.upper             <- exp( log(  or ) + qnorm(0.975) *   or.se )
+
+ps.boot.f            <- function( dt2 ){
+	ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt2 )
+	dt2$weight           <- with( dt2, 
+					 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+					)
+	diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt2 )
+	rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt2 )
+	or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt2 )
+
+	diff                 <-      diff.res$coefficients[ 2 ]
+	rr                   <- exp(   rr.res$coefficients[ 2 ] )
+	or                   <- exp(   or.res$coefficients[ 2 ] )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+ps.boot              <- sapply( 1:1000, function( xxx )ps.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( ps.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( ps.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( ps.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res0.2               <- data.frame(
+				 valiable.selection = "backdoor", 
+				 Method             = "IPTW", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 lower              = c( diff.lower, rr.lower, or.lower ), 
+				 upper              = c( diff.upper, rr.upper, or.upper ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+
+
+
+#--- pretreatment criterion ---#
+
+#-----------------------
+# outcome regression
+reg.formula          <- formula( 
+				 death ~ low_income + age + factor( sex ) + factor( race ) + 
+				 factor( education ) + smokeintensity + smokeyrs + 
+				 factor( active ) + cholesterol + factor( hbp )
+				)
+reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt1 )
+stdreg               <- stdGlm( reg, data = dt1, X = "low_income", x = c( 0, 1 ) )
+
+diff                 <-      f.diff( stdreg$est )
+rr                   <- exp( f.rr(   stdreg$est ) )
+or                   <- exp( f.or(   stdreg$est ) )
+
+ci.diff              <- confint( stdreg, fun = f.diff )
+ci.rr                <- exp( confint( stdreg, fun = f.rr ) )
+ci.or                <- exp( confint( stdreg, fun = f.or ) )
+
+reg.boot.f           <- function( dt2 ){
+	reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt2 )
+	stdreg               <- stdGlm( reg, data = dt2, X = "low_income", x = c( 0, 1 ) )
+
+	diff                 <-      f.diff( stdreg$est )
+	rr                   <- exp( f.rr(   stdreg$est ) )
+	or                   <- exp( f.or(   stdreg$est ) )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+reg.boot             <- sapply( 1:1000, function( xxx )reg.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( reg.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( reg.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( reg.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res1.1               <- data.frame(
+				 valiable.selection = "pretreatment", 
+				 Method             = "Outcome regression", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 rbind( ci.diff, ci.rr, ci.or ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+# propensity score
+ps.formula           <- formula( 
+				 low_income ~ age + factor( sex ) + factor( race ) + 
+				 factor( education ) + smokeintensity + smokeyrs + 
+				 factor( active ) + cholesterol + factor( hbp )
+				)
+ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt1 )
+dt1$weight           <- with( dt1, 
+				 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+				)
+diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt1 )
+rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt1 )
+or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt1 )
+
+diff                 <-      diff.res$coefficients[ 2 ]
+rr                   <- exp(   rr.res$coefficients[ 2 ] )
+or                   <- exp(   or.res$coefficients[ 2 ] )
+
+diff.se              <- sqrt( diag( vcovHC( diff.res, type = "HC0" ) ) )[ 2 ]
+rr.se                <- sqrt( diag( vcovHC(   rr.res, type = "HC0" ) ) )[ 2 ]
+or.se                <- sqrt( diag( vcovHC(   or.res, type = "HC0" ) ) )[ 2 ]
+
+diff.lower           <-           diff   + qnorm(0.025) * diff.se
+rr.lower             <- exp( log(   rr ) + qnorm(0.025) *   rr.se )
+or.lower             <- exp( log(   or ) + qnorm(0.025) *   or.se )
+
+diff.upper           <-          diff + qnorm(0.975) * diff.se
+rr.upper             <- exp( log(  rr ) + qnorm(0.975) *   rr.se )
+or.upper             <- exp( log(  or ) + qnorm(0.975) *   or.se )
+
+ps.boot.f            <- function( dt2 ){
+	ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt2 )
+	dt2$weight           <- with( dt2, 
+					 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+					)
+	diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt2 )
+	rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt2 )
+	or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt2 )
+
+	diff                 <-      diff.res$coefficients[ 2 ]
+	rr                   <- exp(   rr.res$coefficients[ 2 ] )
+	or                   <- exp(   or.res$coefficients[ 2 ] )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+ps.boot              <- sapply( 1:1000, function( xxx )ps.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( ps.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( ps.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( ps.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res1.2               <- data.frame(
+				 valiable.selection = "pretreatment", 
+				 Method             = "IPTW", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 lower              = c( diff.lower, rr.lower, or.lower ), 
+				 upper              = c( diff.upper, rr.upper, or.upper ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+
+
+#--- common cause criterion ---#
+
+#-----------------------
+# outcome regression
+reg.formula          <- formula( 
+				 death ~ low_income + age + factor( sex ) + factor( race ) + 
+				 factor( active ) 
+				)
+reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt1 )
+stdreg               <- stdGlm( reg, data = dt1, X = "low_income", x = c( 0, 1 ) )
+
+diff                 <-      f.diff( stdreg$est )
+rr                   <- exp( f.rr(   stdreg$est ) )
+or                   <- exp( f.or(   stdreg$est ) )
+
+ci.diff              <- confint( stdreg, fun = f.diff )
+ci.rr                <- exp( confint( stdreg, fun = f.rr ) )
+ci.or                <- exp( confint( stdreg, fun = f.or ) )
+
+reg.boot.f           <- function( dt2 ){
+	reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt2 )
+	stdreg               <- stdGlm( reg, data = dt2, X = "low_income", x = c( 0, 1 ) )
+
+	diff                 <-      f.diff( stdreg$est )
+	rr                   <- exp( f.rr(   stdreg$est ) )
+	or                   <- exp( f.or(   stdreg$est ) )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+reg.boot             <- sapply( 1:1000, function( xxx )reg.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( reg.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( reg.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( reg.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res2.1               <- data.frame(
+				 valiable.selection = "common cause", 
+				 Method             = "Outcome regression", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 rbind( ci.diff, ci.rr, ci.or ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+# propensity score
+ps.formula           <- formula( 
+				 low_income ~ age + factor( sex ) + factor( race ) + 
+				 factor( active ) 
+				)
+ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt1 )
+dt1$weight           <- with( dt1, 
+				 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+				)
+diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt1 )
+rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt1 )
+or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt1 )
+
+diff                 <-      diff.res$coefficients[ 2 ]
+rr                   <- exp(   rr.res$coefficients[ 2 ] )
+or                   <- exp(   or.res$coefficients[ 2 ] )
+
+diff.se              <- sqrt( diag( vcovHC( diff.res, type = "HC0" ) ) )[ 2 ]
+rr.se                <- sqrt( diag( vcovHC(   rr.res, type = "HC0" ) ) )[ 2 ]
+or.se                <- sqrt( diag( vcovHC(   or.res, type = "HC0" ) ) )[ 2 ]
+
+diff.lower           <-           diff   + qnorm(0.025) * diff.se
+rr.lower             <- exp( log(   rr ) + qnorm(0.025) *   rr.se )
+or.lower             <- exp( log(   or ) + qnorm(0.025) *   or.se )
+
+diff.upper           <-          diff + qnorm(0.975) * diff.se
+rr.upper             <- exp( log(  rr ) + qnorm(0.975) *   rr.se )
+or.upper             <- exp( log(  or ) + qnorm(0.975) *   or.se )
+
+ps.boot.f            <- function( dt2 ){
+	ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt2 )
+	dt2$weight           <- with( dt2, 
+					 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+					)
+	diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt2 )
+	rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt2 )
+	or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt2 )
+
+	diff                 <-      diff.res$coefficients[ 2 ]
+	rr                   <- exp(   rr.res$coefficients[ 2 ] )
+	or                   <- exp(   or.res$coefficients[ 2 ] )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+ps.boot              <- sapply( 1:1000, function( xxx )ps.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( ps.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( ps.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( ps.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res2.2               <- data.frame(
+				 valiable.selection = "common cause", 
+				 Method             = "IPTW", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 lower              = c( diff.lower, rr.lower, or.lower ), 
+				 upper              = c( diff.upper, rr.upper, or.upper ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+
+
+#--- modified disjunctive cause criterion ---#
+
+#-----------------------
+# outcome regression
+reg.formula          <- formula( 
+				 death ~ low_income + age + factor( sex ) + factor( race ) + 
+				 factor( education ) + smokeintensity + smokeyrs + 
+				 factor( active ) + cholesterol + factor( hbp )
+				)
+reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt1 )
+stdreg               <- stdGlm( reg, data = dt1, X = "low_income", x = c( 0, 1 ) )
+
+diff                 <-      f.diff( stdreg$est )
+rr                   <- exp( f.rr(   stdreg$est ) )
+or                   <- exp( f.or(   stdreg$est ) )
+
+ci.diff              <- confint( stdreg, fun = f.diff )
+ci.rr                <- exp( confint( stdreg, fun = f.rr ) )
+ci.or                <- exp( confint( stdreg, fun = f.or ) )
+
+reg.boot.f           <- function( dt2 ){
+	reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt2 )
+	stdreg               <- stdGlm( reg, data = dt2, X = "low_income", x = c( 0, 1 ) )
+
+	diff                 <-      f.diff( stdreg$est )
+	rr                   <- exp( f.rr(   stdreg$est ) )
+	or                   <- exp( f.or(   stdreg$est ) )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+reg.boot             <- sapply( 1:1000, function( xxx )reg.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( reg.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( reg.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( reg.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res3.1               <- data.frame(
+				 valiable.selection = "disjunctive cause", 
+				 Method             = "Outcome regression", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 rbind( ci.diff, ci.rr, ci.or ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+# propensity score
+ps.formula           <- formula( 
+				 low_income ~ age + factor( sex ) + factor( race ) + 
+				 factor( education ) + smokeintensity + smokeyrs + 
+				 factor( active ) + cholesterol + factor( hbp )
+				)
+ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt1 )
+dt1$weight           <- with( dt1, 
+				 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+				)
+diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt1 )
+rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt1 )
+or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt1 )
+
+diff                 <-      diff.res$coefficients[ 2 ]
+rr                   <- exp(   rr.res$coefficients[ 2 ] )
+or                   <- exp(   or.res$coefficients[ 2 ] )
+
+diff.se              <- sqrt( diag( vcovHC( diff.res, type = "HC0" ) ) )[ 2 ]
+rr.se                <- sqrt( diag( vcovHC(   rr.res, type = "HC0" ) ) )[ 2 ]
+or.se                <- sqrt( diag( vcovHC(   or.res, type = "HC0" ) ) )[ 2 ]
+
+diff.lower           <-           diff   + qnorm(0.025) * diff.se
+rr.lower             <- exp( log(   rr ) + qnorm(0.025) *   rr.se )
+or.lower             <- exp( log(   or ) + qnorm(0.025) *   or.se )
+
+diff.upper           <-          diff + qnorm(0.975) * diff.se
+rr.upper             <- exp( log(  rr ) + qnorm(0.975) *   rr.se )
+or.upper             <- exp( log(  or ) + qnorm(0.975) *   or.se )
+
+ps.boot.f            <- function( dt2 ){
+	ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt2 )
+	dt2$weight           <- with( dt2, 
+					 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+					)
+	diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt2 )
+	rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt2 )
+	or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt2 )
+
+	diff                 <-      diff.res$coefficients[ 2 ]
+	rr                   <- exp(   rr.res$coefficients[ 2 ] )
+	or                   <- exp(   or.res$coefficients[ 2 ] )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+ps.boot              <- sapply( 1:1000, function( xxx )ps.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( ps.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( ps.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( ps.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res3.2               <- data.frame(
+				 valiable.selection = "disjunctive cause", 
+				 Method             = "IPTW", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 lower              = c( diff.lower, rr.lower, or.lower ), 
+				 upper              = c( diff.upper, rr.upper, or.upper ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+
+
+
+#--- backward selection ---#
+
+library( MASS )
+
+reg.formula0         <- formula( 
+				 death ~ low_income + age + factor( sex ) + factor( race ) + 
+				 factor( education ) + smokeintensity + smokeyrs + 
+				 factor( active ) + cholesterol + factor( hbp )
+				)
+ps.formula0          <- formula( 
+				 low_income ~ age + factor( sex ) + factor( race ) + 
+				 factor( education ) + smokeintensity + smokeyrs + 
+				 factor( active ) + cholesterol + factor( hbp )
+				)
+
+
+#-----------------------
+# outcome regression
+reg.formula          <- reg.formula0
+
+reg0                 <- glm( reg.formula, family = binomial( link = "logit" ), data = dt1 )
+reg                  <- stepAIC( reg0, scope = list( lower = ~ low_income ), direction = "backward", trace = FALSE )
+
+stdreg               <- stdGlm( reg, data = dt1, X = "low_income", x = c( 0, 1 ) )
+
+diff                 <-      f.diff( stdreg$est )
+rr                   <- exp( f.rr(   stdreg$est ) )
+or                   <- exp( f.or(   stdreg$est ) )
+
+reg.backward.f       <- function( dt2 ){
+	reg0                 <- glm( reg.formula0, family = binomial( link = "logit" ), data = dt2 )
+	reg                  <- stepAIC( reg0, scope = list( lower = ~ low_income ), direction = "backward", trace = FALSE )
+
+	stdreg               <- stdGlm( reg, data = dt2, X = "low_income", x = c( 0, 1 ) )
+
+	diff                 <-      f.diff( stdreg$est )
+	rr                   <- exp( f.rr(   stdreg$est ) )
+	or                   <- exp( f.or(   stdreg$est ) )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+reg.backward.res     <- sapply( 1:1000, function( xxx )reg.backward.f( dt1[ ind[ , xxx ],  ] ) )
+
+ci.diff              <- confint( stdreg, fun = f.diff )
+ci.rr                <- exp( confint( stdreg, fun = f.rr ) )
+ci.or                <- exp( confint( stdreg, fun = f.or ) )
+
+bootci.diff          <- quantile( reg.backward.res[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( reg.backward.res[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( reg.backward.res[ 3, ], c( 0.025, 0.975 ) )
+
+res4.1               <- data.frame(
+				 valiable.selection = "backward(OR model)", 
+				 Method             = "Outcome regression", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 rbind( ci.diff, ci.rr, ci.or ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+# propensity score
+ps.formula           <- ps.formula0
+ps.reg0              <- glm( ps.formula, family = binomial( link = "logit" ), data = dt1 )
+ps.reg               <- stepAIC( ps.reg0, direction = "backward" )
+dt1$weight           <- with( dt1, 
+				 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+				)
+diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt1 )
+rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt1 )
+or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt1 )
+
+diff                 <-      diff.res$coefficients[ 2 ]
+rr                   <- exp(   rr.res$coefficients[ 2 ] )
+or                   <- exp(   or.res$coefficients[ 2 ] )
+
+ps.backward.f        <- function( dt2 ){
+	ps.reg0              <- glm( ps.formula0, family = binomial( link = "logit" ), data = dt2 )
+	ps.reg               <- stepAIC( ps.reg0, direction = "backward", trace = FALSE )
+	dt2$weight           <- with( dt2, 
+					 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+					)
+	diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt2 )
+	rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt2 )
+	or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt2 )
+
+	diff                 <-      diff.res$coefficients[ 2 ]
+	rr                   <- exp(   rr.res$coefficients[ 2 ] )
+	or                   <- exp(   or.res$coefficients[ 2 ] )
+
+	output               <- c( diff, rr, or )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+ps.backward.res      <- sapply( 1:1000, function( xxx )ps.backward.f( dt1[ ind[ , xxx ],  ] ) )
+
+diff.se              <- sqrt( diag( vcovHC( diff.res, type = "HC0" ) ) )[ 2 ]
+rr.se                <- sqrt( diag( vcovHC(   rr.res, type = "HC0" ) ) )[ 2 ]
+or.se                <- sqrt( diag( vcovHC(   or.res, type = "HC0" ) ) )[ 2 ]
+
+diff.lower           <-           diff   + qnorm(0.025) * diff.se
+rr.lower             <- exp( log(   rr ) + qnorm(0.025) *   rr.se )
+or.lower             <- exp( log(   or ) + qnorm(0.025) *   or.se )
+
+diff.upper           <-          diff + qnorm(0.975) * diff.se
+rr.upper             <- exp( log(  rr ) + qnorm(0.975) *   rr.se )
+or.upper             <- exp( log(  or ) + qnorm(0.975) *   or.se )
+
+bootci.diff          <- quantile( ps.backward.res[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( ps.backward.res[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( ps.backward.res[ 3, ], c( 0.025, 0.975 ) )
+
+res4.2               <- data.frame(
+				 valiable.selection = "backward(PS model)", 
+				 Method             = "IPTW", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 lower              = c( diff.lower, rr.lower, or.lower ), 
+				 upper              = c( diff.upper, rr.upper, or.upper ), 
+				 lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+				)
+#-----------------------
+
+varis                <- unique( c( names( model.frame( reg )[ , - (1:2) ] ), names( model.frame( ps.reg )[ , -1 ] ) ) )
+
+#-----------------------
+# outcome regression
+reg.formula          <- paste0( "death ~ low_income + ", paste0( varis, collapse = " + " ) )
+reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt1 )
+
+stdreg               <- stdGlm( reg, data = dt1, X = "low_income", x = c( 0, 1 ) )
+
+diff                 <-      f.diff( stdreg$est )
+rr                   <- exp( f.rr(   stdreg$est ) )
+or                   <- exp( f.or(   stdreg$est ) )
+
+ci.diff              <- confint( stdreg, fun = f.diff )
+ci.rr                <- exp( confint( stdreg, fun = f.rr ) )
+ci.or                <- exp( confint( stdreg, fun = f.or ) )
+
+res4.3               <- data.frame(
+				 valiable.selection = "backward(disjunctive)", 
+				 Method             = "Outcome regression", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 rbind( ci.diff, ci.rr, ci.or )
+				)
+#-----------------------
+# propensity score
+ps.formula           <- paste0( "low_income ~ ", paste0( varis, collapse = " + " ) )
+ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt1 )
+dt1$weight           <- with( dt1, 
+				 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+				)
+diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt1 )
+rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt1 )
+or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt1 )
+
+diff                 <-      diff.res$coefficients[ 2 ]
+rr                   <- exp(   rr.res$coefficients[ 2 ] )
+or                   <- exp(   or.res$coefficients[ 2 ] )
+
+diff.se              <- sqrt( diag( vcovHC( diff.res, type = "HC0" ) ) )[ 2 ]
+rr.se                <- sqrt( diag( vcovHC(   rr.res, type = "HC0" ) ) )[ 2 ]
+or.se                <- sqrt( diag( vcovHC(   or.res, type = "HC0" ) ) )[ 2 ]
+
+diff.lower           <-           diff   + qnorm(0.025) * diff.se
+rr.lower             <- exp( log(   rr ) + qnorm(0.025) *   rr.se )
+or.lower             <- exp( log(   or ) + qnorm(0.025) *   or.se )
+
+diff.upper           <-            diff + qnorm(0.975) * diff.se
+rr.upper             <- exp( log(  rr ) + qnorm(0.975) *   rr.se )
+or.upper             <- exp( log(  or ) + qnorm(0.975) *   or.se )
+
+res4.4               <- data.frame(
+				 valiable.selection = "backward(disjunctive)", 
+				 Method             = "IPTW", 
+				 Estimand           = c( "Diff", "RR", "OR" ), 
+				 Est                = c( diff, rr, or ), 
+				 lower              = c( diff.lower, rr.lower, or.lower ), 
+				 upper              = c( diff.upper, rr.upper, or.upper )
+				)
+
+reg.ps.backward.f    <- function( dt2 ){
+	reg0                 <- glm( reg.formula0, family = binomial( link = "logit" ), data = dt2 )
+	reg                  <- stepAIC( reg0, scope = list( lower = ~ low_income ), direction = "backward", trace = FALSE )
+
+	ps.reg0              <- glm( ps.formula0, family = binomial( link = "logit" ), data = dt2 )
+	ps.reg               <- stepAIC( ps.reg0, direction = "backward", trace = FALSE )
+
+	varis                <- unique( c( names( model.frame( reg )[ , - (1:2) ] ), names( model.frame( ps.reg )[ , -1 ] ) ) )
+
+	# outcome regression
+	reg.formula          <- paste0( "death ~ low_income + ", paste0( varis, collapse = " + " ) )
+	reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt2 )
+
+	stdreg               <- stdGlm( reg, data = dt2, X = "low_income", x = c( 0, 1 ) )
+
+	diff.reg             <-      f.diff( stdreg$est )
+	rr.reg               <- exp( f.rr(   stdreg$est ) )
+	or.reg               <- exp( f.or(   stdreg$est ) )
+
+	ps.formula           <- paste0( "low_income ~ ", paste0( varis, collapse = " + " ) )
+	ps.reg               <- glm( ps.formula, family = binomial( link = "logit" ), data = dt2 )
+	dt2$weight           <- with( dt2, 
+					 ifelse( low_income==1, 1/ps.reg$fitted.values, 1/(1-ps.reg$fitted.values))
+					)
+	diff.res             <- glm( death ~ low_income, weight = weight, family = binomial( link = "identity" ), data = dt2 )
+	rr.res               <- glm( death ~ low_income, weight = weight, family = poisson(  link = "log"      ), data = dt2 )
+	or.res               <- glm( death ~ low_income, weight = weight, family = binomial( link = "logit"    ), data = dt2 )
+
+	diff.iptw            <-      diff.res$coefficients[ 2 ]
+	rr.iptw              <- exp(   rr.res$coefficients[ 2 ] )
+	or.iptw              <- exp(   or.res$coefficients[ 2 ] )
+
+	output               <- c( diff.reg, rr.reg, or.reg, diff.iptw, rr.iptw, or.iptw )
+	return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+reg.ps.backward.res  <- sapply( 1:1000, function( xxx )reg.ps.backward.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff.reg      <- quantile( reg.ps.backward.res[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr.reg        <- quantile( reg.ps.backward.res[ 2, ], c( 0.025, 0.975 ) )
+bootci.or.reg        <- quantile( reg.ps.backward.res[ 3, ], c( 0.025, 0.975 ) )
+
+bootci.diff.iptw     <- quantile( reg.ps.backward.res[ 4, ], c( 0.025, 0.975 ) )
+bootci.rr.iptw       <- quantile( reg.ps.backward.res[ 5, ], c( 0.025, 0.975 ) )
+bootci.or.iptw       <- quantile( reg.ps.backward.res[ 6, ], c( 0.025, 0.975 ) )
+
+
+res4.3               <- data.frame(
+				 res4.3, 
+				 lower.bootCI       = c( bootci.diff.reg[ 1 ], bootci.rr.reg[ 1 ], bootci.or.reg[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff.reg[ 2 ], bootci.rr.reg[ 2 ], bootci.or.reg[ 2 ] )
+				)
+
+res4.4               <- data.frame(
+				 res4.4, 
+				 lower.bootCI       = c( bootci.diff.iptw[ 1 ], bootci.rr.iptw[ 1 ], bootci.or.iptw[ 1 ] ), 
+				 upper.bootCI       = c( bootci.diff.iptw[ 2 ], bootci.rr.iptw[ 2 ], bootci.or.iptw[ 2 ] )
+				)
+#-----------------------
+
+
+
+outcome_regression1 <- rbind( res0.1, res1.1, res2.1, res3.1 )
+outcome_regression2 <- rbind( res4.1, res4.3 )
+
+IPTW1               <- rbind( res0.2, res1.2, res2.2, res3.2 )
+IPTW2               <- rbind( res4.2, res4.4 )
+
+outcome_regression1$Estimate     <- format( round( outcome_regression1$Est, 3 ), nsmall = 3 )
+outcome_regression1$CI           <- paste0( 
+						 "[", 
+						 format( round( outcome_regression1$lower, 3 ), nsmall = 3 ), 
+						 ", ", 
+						 format( round( outcome_regression1$upper, 3 ), nsmall = 3 ), 
+						 "]"
+						)
+outcome_regression1$CI.boot      <- paste0( 
+						 "[", 
+						 format( round( outcome_regression1$lower.bootCI, 3 ), nsmall = 3 ), 
+						 ", ", 
+						 format( round( outcome_regression1$upper.bootCI, 3 ), nsmall = 3 ), 
+						 "]"
+						)
+outcome_regression2$Estimate     <- format( round( outcome_regression2$Est, 3 ), nsmall = 3 )
+outcome_regression2$CI           <- paste0( 
+						 "[", 
+						 format( round( outcome_regression2$lower, 3 ), nsmall = 3 ), 
+						 ", ", 
+						 format( round( outcome_regression2$upper, 3 ), nsmall = 3 ), 
+						 "]"
+						)
+outcome_regression2$CI.boot      <- paste0( 
+						 "[", 
+						 format( round( outcome_regression2$lower.bootCI, 3 ), nsmall = 3 ), 
+						 ", ", 
+						 format( round( outcome_regression2$upper.bootCI, 3 ), nsmall = 3 ), 
+						 "]"
+						)
+
+IPTW1$Estimate                   <- format( round( IPTW1$Est, 3 ), nsmall = 3 )
+IPTW1$CI                         <- paste0( 
+						 "[", 
+						 format( round( IPTW1$lower, 3 ), nsmall = 3 ), 
+						 ", ", 
+						 format( round( IPTW1$upper, 3 ), nsmall = 3 ), 
+						 "]"
+						)
+						)
+IPTW1$CI.boot                    <- paste0( 
+						 "[", 
+						 format( round( IPTW1$lower.bootCI, 3 ), nsmall = 3 ), 
+						 ", ", 
+						 format( round( IPTW1$upper.bootCI, 3 ), nsmall = 3 ), 
+						 "]"
+						)
+IPTW2$Estimate                   <- format( round( IPTW2$Est, 3 ), nsmall = 3 )
+IPTW2$CI                         <- paste0( 
+						 "[", 
+						 format( round( IPTW2$lower, 3 ), nsmall = 3 ), 
+						 ", ", 
+						 format( round( IPTW2$upper, 3 ), nsmall = 3 ), 
+						 "]"
+						)
+IPTW2$CI.boot                    <- paste0( 
+						 "[", 
+						 format( round( IPTW2$lower.bootCI, 3 ), nsmall = 3 ), 
+						 ", ", 
+						 format( round( IPTW2$upper.bootCI, 3 ), nsmall = 3 ), 
+						 "]"
+						)
+
+outcome_regression               <- rbind( outcome_regression1, outcome_regression2 )
+IPTW                             <- rbind( IPTW1, IPTW2 )
+
+outcome_regression$Estimand      <- factor( outcome_regression$Estimand, levels = c( "Diff", "RR", "OR" ) )
+outcome_regression               <- outcome_regression[ order( outcome_regression$Estimand ), ]
+
+IPTW$Estimand                    <- factor( IPTW$Estimand, levels = c( "Diff", "RR", "OR" ) )
+IPTW                             <- IPTW[ order( IPTW$Estimand ), ]
+
+write.csv( outcome_regression , "Table2.0.1_outcome_regression.csv" )
+write.csv( IPTW               , "Table2.0.2_IPTW.csv" )
+
+
+#--- Sensitivity analyses to unmeasured confounders ---#
+# outcome regression
+reg.formula          <- formula( 
+  death ~ low_income + age + factor( sex ) + factor( race ) + 
+    factor( education ) + smokeintensity + smokeyrs + 
+    factor( active ) + cholesterol + factor( hbp )
+)
+reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt1 )
+stdreg               <- stdGlm( reg, data = dt1, X = "low_income", x = c( 0, 1 ) )
+
+diff                 <-      f.diff( stdreg$est )
+rr                   <- exp( f.rr(   stdreg$est ) )
+or                   <- exp( f.or(   stdreg$est ) )
+
+ci.diff              <- confint( stdreg, fun = f.diff )
+ci.rr                <- exp( confint( stdreg, fun = f.rr ) )
+ci.or                <- exp( confint( stdreg, fun = f.or ) )
+
+reg.boot.f           <- function( dt2 ){
+  reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt2 )
+  stdreg               <- stdGlm( reg, data = dt2, X = "low_income", x = c( 0, 1 ) )
+  
+  diff                 <-      f.diff( stdreg$est )
+  rr                   <- exp( f.rr(   stdreg$est ) )
+  or                   <- exp( f.or(   stdreg$est ) )
+  
+  output               <- c( diff, rr, or )
+  return( output )
+}
+ind                  <- sapply( 1:1000, function( xxx )sample( 1:dim( dt1 )[ 1 ], dim( dt1 )[ 1 ], replace = TRUE ) )
+reg.boot             <- sapply( 1:1000, function( xxx )reg.boot.f( dt1[ ind[ , xxx ],  ] ) )
+
+bootci.diff          <- quantile( reg.boot[ 1, ], c( 0.025, 0.975 ) )
+bootci.rr            <- quantile( reg.boot[ 2, ], c( 0.025, 0.975 ) )
+bootci.or            <- quantile( reg.boot[ 3, ], c( 0.025, 0.975 ) )
+
+res3.1               <- data.frame(
+  valiable.selection = "disjunctive cause", 
+  Method             = "Outcome regression", 
+  Estimand           = c( "Diff", "RR", "OR" ), 
+  Est                = c( diff, rr, or ), 
+  rbind( ci.diff, ci.rr, ci.or ), 
+  lower.bootCI       = c( bootci.diff[ 1 ], bootci.rr[ 1 ], bootci.or[ 1 ] ), 
+  upper.bootCI       = c( bootci.diff[ 2 ], bootci.rr[ 2 ], bootci.or[ 2 ] )
+)
+
+
+
+#Evalue
+library(EValue)
+reg.formula          <- formula( 
+  death ~ low_income + age + factor( sex ) + factor( race ) + 
+    factor( education ) + smokeintensity + smokeyrs + 
+    factor( active ) + cholesterol + hbp 
+)
+reg                  <- glm( reg.formula, family = binomial( link = "logit" ), data = dt1 )
+evalues.OR(est = exp(summary(reg)$coefficients['low_income', 'Estimate']),
+           lo = exp(summary(reg)$coefficients['low_income', 'Estimate']-1.96*summary(reg)$coefficients['low_income', 'Std. Error']),
+           hi = exp(summary(reg)$coefficients['low_income', 'Estimate']+1.96*summary(reg)$coefficients['low_income', 'Std. Error']),
+           rare=TRUE)
+
+
+#Robustness value
+library(sensemakr)
+reg                  <- lm( reg.formula, data = dt1 )
+sensitivity <- sensemakr(reg, treatment = "low_income", benchmark_covariates=c("hbp"), kd=1:2)
+#short description of results
+sensitivity
+summary(sensitivity)
+plot(sensitivity, 
+     lim=0.1, lim.y=0.1, 
+     label.bump.x = 0.01, label.bump.y = 0.002) 
+
+
